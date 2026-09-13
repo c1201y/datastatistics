@@ -162,7 +162,7 @@ body{
   background-size:22px 22px;
   color:var(--text);
   font-family:'Press Start 2P','ZCOOL KuaiLe',monospace;
-  display:flex;align-items:center;justify-content:center;
+  display:flex;align-items:flex-start;justify-content:center;
   padding:24px;
   transition:background .4s,color .4s;
   overflow-x:hidden;
@@ -210,6 +210,7 @@ body{
 @keyframes floatUp{0%{transform:translateY(0) rotate(0);opacity:0;}10%{opacity:.4;}100%{transform:translateY(-120vh) rotate(360deg);opacity:0;}}
 
 .cabinet{
+  margin:auto 0;
   position:relative;z-index:1;
   width:min(720px,100%);
   background:var(--cabinet);
