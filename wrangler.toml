@@ -6,4 +6,4 @@ compatibility_date = "2024-09-23"
 # 把下面 id 换成那条命令输出的 id
 [[kv_namespaces]]
 binding = "STATS"
-id = "REPLACE_WITH_YOUR_KV_ID"
+id = "2764a0b77548413c9e84358b0b5fa6af"
