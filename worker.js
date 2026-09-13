@@ -186,6 +186,10 @@ function cors(res, request) {
   }
   res.headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.headers.set('Access-Control-Allow-Headers', 'Content-Type');
+  // 统计接口绝不能被缓存：否则同一页面第二次访问会拿到缓存响应、不计数也不刷新。
+  res.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+  res.headers.set('Pragma', 'no-cache');
+  res.headers.set('Expires', '0');
   return res;
 }
 
