@@ -1,0 +1,9 @@
+name = "csh-stats"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+# 部署前先建 KV：  wrangler kv namespace create STATS
+# 把下面 id 换成那条命令输出的 id
+[[kv_namespaces]]
+binding = "STATS"
+id = "REPLACE_WITH_YOUR_KV_ID"
