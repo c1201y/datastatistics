@@ -23,18 +23,22 @@
 // ============================================================================
 
 const KEY = 'STATS_JSON';
-const VID = 'csh_vid';
-const ONLINE_WINDOW = 300000; // 5 分钟窗口，判定“在线”
+const VID = 'csh_vid';            // 仅作“是否新访客”标记（UV 去重）
+const UID = 'csh_uid';            // 随机唯一访客 id，用于“在线人数”去重
+const ONLINE_WINDOW = 300000;     // 5 分钟窗口，判定“在线”
+const TZ_OFFSET_MS = 8 * 3600000; // 北京时间 UTC+8（“今日”与逐小时图按此计算）
 
 function defState() {
-  return { pv: 0, uv: 0, today: 0, todayDate: '', days: {}, hours: {}, paths: {}, domains: {}, seen: [] };
+  return { pv: 0, uv: 0, today: 0, todayDate: '', days: {}, hours: {}, paths: {}, domains: {}, seen: {} };
 }
 async function load(env) {
   try {
     const s = await env.STATS.get(KEY);
     if (!s) return defState();
     const o = JSON.parse(s);
-    return Object.assign(defState(), o);
+    const st = Object.assign(defState(), o);
+    if (Array.isArray(st.seen)) st.seen = {}; // 迁移：旧版 seen 是时间戳数组 → {uid: ts}
+    return st;
   } catch (e) {
     return defState();
   }
@@ -42,18 +46,22 @@ async function load(env) {
 async function save(env, st) {
   await env.STATS.put(KEY, JSON.stringify(st));
 }
+// 以北京时间取日期串（YYYY-MM-DD），offset 为相对天数
 function dayStr(offset) {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() + offset);
+  const d = new Date(Date.now() + TZ_OFFSET_MS + offset * 86400000);
   return d.toISOString().slice(0, 10);
+}
+function readCookie(cookie, name) {
+  const m = cookie.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]*)'));
+  return m ? m[1] : '';
 }
 
 async function hit(env, request, ctx) {
   const st = await load(env);
   const now = Date.now();
-  const d = new Date();
-  const dateStr = d.toISOString().slice(0, 10);
-  const hour = d.getUTCHours();
+  const bj = new Date(now + TZ_OFFSET_MS); // 北京时间
+  const dateStr = bj.toISOString().slice(0, 10);
+  const hour = bj.getUTCHours();
 
   if (st.todayDate !== dateStr) { st.todayDate = dateStr; st.today = 0; st.hours = {}; }
   st.pv += 1;
@@ -63,10 +71,19 @@ async function hit(env, request, ctx) {
   st.hours[dateStr][hour] = (st.hours[dateStr][hour] || 0) + 1;
 
   const url = new URL(request.url);
-  const domain = url.hostname;
-  st.domains[domain] = (st.domains[domain] || 0) + 1;
-  const path = url.pathname || '/';
-  st.paths[path] = (st.paths[path] || 0) + 1;
+  const apiHost = url.hostname; // 统计服务自身的域名（不应计入来源统计）
+
+  // 真实来源域名：优先前端显式传的 ?host=，其次 Referer，最后退化到 Worker 自身域名。
+  let domain = url.searchParams.get('host') || '';
+  if (!domain) {
+    const ref = request.headers.get('Referer') || '';
+    try { domain = ref ? new URL(ref).hostname : ''; } catch (e) { domain = ''; }
+  }
+  if (domain && domain !== apiHost) st.domains[domain] = (st.domains[domain] || 0) + 1;
+
+  // 真实访问页面：优先 ?page=，否则退化到路径；过滤掉统计接口自身的 /api/* 路径。
+  const path = url.searchParams.get('page') || url.pathname || '/';
+  if (path.indexOf('/api/') !== 0) st.paths[path] = (st.paths[path] || 0) + 1;
 
   // paths 只保留 Top 40，避免 KV 无限膨胀
   const pk = Object.keys(st.paths);
@@ -76,18 +93,34 @@ async function hit(env, request, ctx) {
     for (const k of pk) { if (!keep.has(k)) delete st.paths[k]; }
   }
 
+  // 访客 Cookie：
+  //   VID 只当“是否新访客”的标记（UV 去重）；UID 是随机唯一 id，用于“在线人数”按访客去重。
   const cookie = request.headers.get('Cookie') || '';
-  let setCookie = null;
+  const setCookies = [];
   if (cookie.indexOf(VID + '=') === -1) {
     st.uv += 1;
-    setCookie = VID + '=1; Max-Age=31536000; Path=/; SameSite=None; Secure';
+    setCookies.push(VID + '=1; Max-Age=31536000; Path=/; SameSite=None; Secure');
+  }
+  let uid = readCookie(cookie, UID);
+  if (!uid) {
+    uid = Math.random().toString(36).slice(2) + now.toString(36);
+    setCookies.push(UID + '=' + uid + '; Max-Age=31536000; Path=/; SameSite=None; Secure');
   }
 
-  st.seen = (st.seen || []).filter(function (t) { return now - t < ONLINE_WINDOW; }).concat([now]).slice(-2000);
+  // 在线：按 uid 去重，只保留 5 分钟窗口内的活跃访客（同一人反复刷新只算 1 个在线）。
+  if (!st.seen || Array.isArray(st.seen)) st.seen = {};
+  for (const k in st.seen) { if (now - st.seen[k] > ONLINE_WINDOW) delete st.seen[k]; }
+  st.seen[uid] = now;
+  // 安全上限，防止异常情况下无限膨胀
+  const seenKeys = Object.keys(st.seen);
+  if (seenKeys.length > 5000) {
+    seenKeys.sort(function (a, b) { return st.seen[a] - st.seen[b]; });
+    for (let i = 0; i < seenKeys.length - 5000; i++) delete st.seen[seenKeys[i]];
+  }
 
   const body = JSON.stringify({ pv: st.pv, uv: st.uv, today: st.today });
-  const headers = { 'Content-Type': 'application/json' };
-  if (setCookie) headers['Set-Cookie'] = setCookie;
+  const headers = new Headers({ 'Content-Type': 'application/json' });
+  for (const c of setCookies) headers.append('Set-Cookie', c);
   const response = cors(new Response(body, { headers: headers }), request);
 
   // 后台落库：绝不阻塞/失败前端响应。
@@ -105,22 +138,30 @@ async function hit(env, request, ctx) {
 async function stats(env, request) {
   const st = await load(env);
   const now = Date.now();
-  const seen = (st.seen || []).filter(function (t) { return now - t < ONLINE_WINDOW; });
-  const online = seen.length;
+  const apiHost = new URL(request.url).hostname;
+
+  // 在线人数：按 uid 去重（同一访客反复刷新只算 1 个），只统计 5 分钟内活跃的访客。
+  const seenObj = (st.seen && !Array.isArray(st.seen)) ? st.seen : {};
+  let online = 0;
+  for (const k in seenObj) { if (now - seenObj[k] < ONLINE_WINDOW) online++; }
 
   const days = [];
   for (let i = 6; i >= 0; i--) days.push(st.days[dayStr(-i)] || 0);
 
-  const dateStr = new Date().toISOString().slice(0, 10);
+  const dateStr = new Date(now + TZ_OFFSET_MS).toISOString().slice(0, 10); // 北京时间“今日”
   const hobj = st.hours[dateStr] || {};
   const hours = [];
   for (let h = 0; h < 24; h++) hours.push(hobj[h] || 0);
 
+  // 过滤掉统计服务自身域名（历史脏数据 + 兜底），只展示真实来源域名
   const domains = Object.keys(st.domains)
+    .filter(function (k) { return k && k !== apiHost; })
     .map(function (k) { return { domain: k, count: st.domains[k] }; })
     .sort(function (a, b) { return b.count - a.count; });
 
+  // 过滤掉统计接口自身的 /api/* 路径
   const paths = Object.keys(st.paths)
+    .filter(function (k) { return k.indexOf('/api/') !== 0; })
     .map(function (k) { return { path: k, count: st.paths[k] }; })
     .sort(function (a, b) { return b.count - a.count; }).slice(0, 8);
 
