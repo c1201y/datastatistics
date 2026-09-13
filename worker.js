@@ -48,7 +48,7 @@ function dayStr(offset) {
   return d.toISOString().slice(0, 10);
 }
 
-async function hit(env, request) {
+async function hit(env, request, ctx) {
   const st = await load(env);
   const now = Date.now();
   const d = new Date();
@@ -84,12 +84,22 @@ async function hit(env, request) {
   }
 
   st.seen = (st.seen || []).filter(function (t) { return now - t < ONLINE_WINDOW; }).concat([now]).slice(-2000);
-  await save(env, st);
 
   const body = JSON.stringify({ pv: st.pv, uv: st.uv, today: st.today });
   const headers = { 'Content-Type': 'application/json' };
   if (setCookie) headers['Set-Cookie'] = setCookie;
-  return cors(new Response(body, { headers: headers }), request);
+  const response = cors(new Response(body, { headers: headers }), request);
+
+  // 后台落库：绝不阻塞/失败前端响应。
+  // 若 KV 未绑定或偶发抖动，前端仍能拿到本次计算出的数字（只是不持久化）。
+  if (env && env.STATS && typeof env.STATS.put === 'function') {
+    const saver = save(env, st);
+    if (ctx && ctx.waitUntil) ctx.waitUntil(saver.catch(function () {}));
+    else await saver.catch(function () {});
+  } else {
+    console.warn('[stats] KV 未绑定 (env.STATS 缺失)：本次计数仅内存有效、不会持久化。请在 Cloudflare 绑定名为 STATS 的 KV 命名空间。');
+  }
+  return response;
 }
 
 async function stats(env, request) {
@@ -503,7 +513,7 @@ export default {
     if (request.method === 'OPTIONS') {
       return cors(new Response(null, { status: 204 }), request);
     }
-    if (url.pathname === '/api/hit') return await hit(env, request);
+    if (url.pathname === '/api/hit') return await hit(env, request, ctx);
     if (url.pathname === '/api/stats') return await stats(env, request);
     if (url.pathname === '/' || url.pathname === '/index.html') {
       return new Response(DASHBOARD, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
