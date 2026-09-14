@@ -7,6 +7,7 @@
 //                       { pv, uv, today, online, days[7], hours[24],
 //                         domains[], paths[], peak{date,count} }
 //    3) / 或 /index  —— 返回像素风统计仪表盘网页（同文件内 DASHBOARD）
+//  写入做了 60 秒节流缓冲：免费版 KV 每天 1000 次写操作也够用（详见下方注释）。
 //  三个域名（classsoftwarehub.132614.xyz / xfane.com / 另一个）都调用同一个
 //  Worker 地址，KV 里只有一份计数，天然合并成总数，并可在仪表盘里按域名拆分查看。
 //
@@ -43,8 +44,53 @@ async function load(env) {
     return defState();
   }
 }
-async function save(env, st) {
-  await env.STATS.put(KEY, JSON.stringify(st));
+
+// ---------------------------------------------------------------------------
+//  KV 写入缓冲（省配额：Workers 免费版 KV 每天只有 1000 次"写"操作）
+//  旧版：每个 hit 都 load 一次 + save 一次 KV，几百个访问就把写配额烧光（429）。
+//  新版：
+//    * 每个 isolate 只在第一个请求时读一次 KV，之后全部走内存（读也省了）；
+//    * 计数变更先记在内存（dirty = true），距上次落库超过 FLUSH_INTERVAL
+//      才真正写一次 KV —— 一天的写次数 ≈ 活跃时段数，而不是访问次数。
+//  代价（计数场景都可接受）：
+//    * isolate 被回收时最多丢掉一个间隔内的计数；
+//    * 多 isolate 并发写入时，后落库的会覆盖先落库的。
+// ---------------------------------------------------------------------------
+let state = null;          // 内存中的统计快照（每个 isolate 一份）
+let dirty = false;         // 是否有未落库的变更
+let lastFlushAt = 0;       // 上次尝试落库的时间（失败也计时，起到退避作用）
+let loadPromise = null;
+let flushPromise = null;
+const FLUSH_INTERVAL = 60000; // 两次落库的最小间隔（毫秒）
+
+function getState(env) {
+  if (state) return Promise.resolve(state);
+  if (!loadPromise) {
+    loadPromise = load(env).then(function (s) { state = s; return s; })
+      .catch(function () { state = defState(); return state; });
+  }
+  return loadPromise;
+}
+
+async function doFlush(env) {
+  if (!dirty || !state) return;
+  if (!env || !env.STATS || typeof env.STATS.put !== 'function') return;
+  try {
+    await env.STATS.put(KEY, JSON.stringify(state));
+    dirty = false;
+  } catch (e) {
+    // 写失败（常见是 429 配额用尽）：保持 dirty，等下个间隔重试，绝不抛错影响响应
+  } finally {
+    lastFlushAt = Date.now();
+  }
+}
+
+function scheduleFlush(env, ctx) {
+  if (!dirty) return;
+  if (Date.now() - lastFlushAt < FLUSH_INTERVAL) return; // 攒着，等后面的请求再落库
+  if (flushPromise) return;
+  flushPromise = doFlush(env).finally(function () { flushPromise = null; });
+  if (ctx && ctx.waitUntil) ctx.waitUntil(flushPromise);
 }
 // 以北京时间取日期串（YYYY-MM-DD），offset 为相对天数
 function dayStr(offset) {
@@ -57,7 +103,7 @@ function readCookie(cookie, name) {
 }
 
 async function hit(env, request, ctx) {
-  const st = await load(env);
+  const st = await getState(env);
   const now = Date.now();
   const bj = new Date(now + TZ_OFFSET_MS); // 北京时间
   const dateStr = bj.toISOString().slice(0, 10);
@@ -123,20 +169,20 @@ async function hit(env, request, ctx) {
   for (const c of setCookies) headers.append('Set-Cookie', c);
   const response = cors(new Response(body, { headers: headers }), request);
 
-  // 后台落库：绝不阻塞/失败前端响应。
-  // 若 KV 未绑定或偶发抖动，前端仍能拿到本次计算出的数字（只是不持久化）。
-  if (env && env.STATS && typeof env.STATS.put === 'function') {
-    const saver = save(env, st);
-    if (ctx && ctx.waitUntil) ctx.waitUntil(saver.catch(function () {}));
-    else await saver.catch(function () {});
-  } else {
+  // 标记有变更，按间隔节流落库：绝不阻塞/失败前端响应。
+  // 攒在内存里的计数会在 60 秒后的某次请求中后台写回 KV；
+  // 若 KV 未绑定或配额用尽（429），前端仍能拿到本次计算出的数字。
+  if (!env || !env.STATS || typeof env.STATS.put !== 'function') {
     console.warn('[stats] KV 未绑定 (env.STATS 缺失)：本次计数仅内存有效、不会持久化。请在 Cloudflare 绑定名为 STATS 的 KV 命名空间。');
+  } else {
+    dirty = true;
+    scheduleFlush(env, ctx);
   }
   return response;
 }
 
 async function stats(env, request) {
-  const st = await load(env);
+  const st = await getState(env);
   const now = Date.now();
   const apiHost = new URL(request.url).hostname;
 
