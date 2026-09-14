@@ -51,23 +51,36 @@ async function load(env) {
 //  新版：
 //    * 每个 isolate 只在第一个请求时读一次 KV，之后全部走内存（读也省了）；
 //    * 计数变更先记在内存（dirty = true），距上次落库超过 FLUSH_INTERVAL
-//      才真正写一次 KV —— 一天的写次数 ≈ 活跃时段数，而不是访问次数。
+//      才真正写一次 KV —— 一天的写次数 ≈ 活跃时段数，而不是访问次数；
+//    * 缓存带 TTL（计数 60 秒、仪表盘 15 秒）到期就重新读一次 KV 校准。
+//      「读」配额很充裕（10 万/天），这样才不会因为省写把实时性弄丢；
+//      唯一的例外是 dirty 时不重读 —— 内存里压着没落库的计数，丢不得。
 //  代价（计数场景都可接受）：
+//    * 新 isolate 刚起的一瞬间可能看不到别处最近一次未落库的计数（≤ 60 秒）；
 //    * isolate 被回收时最多丢掉一个间隔内的计数；
 //    * 多 isolate 并发写入时，后落库的会覆盖先落库的。
 // ---------------------------------------------------------------------------
 let state = null;          // 内存中的统计快照（每个 isolate 一份）
 let dirty = false;         // 是否有未落库的变更
 let lastFlushAt = 0;       // 上次尝试落库的时间（失败也计时，起到退避作用）
+let loadedAt = 0;          // 这份快照是什么时候从 KV 读出来的
 let loadPromise = null;
 let flushPromise = null;
 const FLUSH_INTERVAL = 60000; // 两次落库的最小间隔（毫秒）
+const STAT_TTL = 15000;       // 仪表盘可接受的“新鲜度”：超过就重新拉一次 KV（读很便宜）
+const HIT_TTL = 60000;        // 计数请求也定期校准一次，避免用很旧的基数去覆盖别人刚写进来的数
 
-function getState(env) {
-  if (state) return Promise.resolve(state);
+// ttl = 这份缓存最多能用多久。超过就重新从 KV 读一次，保证“实时”。
+// 例外：dirty === true 时绝不重读 —— 内存里还压着没落库的计数，丢不得。
+function getState(env, ttl) {
+  if (state) {
+    if (dirty) return Promise.resolve(state);
+    if (!ttl || Date.now() - loadedAt <= ttl) return Promise.resolve(state);
+  }
   if (!loadPromise) {
-    loadPromise = load(env).then(function (s) { state = s; return s; })
-      .catch(function () { state = defState(); return state; });
+    loadPromise = load(env).then(function (s) { state = s; loadedAt = Date.now(); return s; })
+      .catch(function () { state = defState(); loadedAt = Date.now(); return state; })
+      .finally(function () { loadPromise = null; });
   }
   return loadPromise;
 }
@@ -103,7 +116,7 @@ function readCookie(cookie, name) {
 }
 
 async function hit(env, request, ctx) {
-  const st = await getState(env);
+  const st = await getState(env, HIT_TTL);
   const now = Date.now();
   const bj = new Date(now + TZ_OFFSET_MS); // 北京时间
   const dateStr = bj.toISOString().slice(0, 10);
@@ -182,7 +195,7 @@ async function hit(env, request, ctx) {
 }
 
 async function stats(env, request) {
-  const st = await getState(env);
+  const st = await getState(env, STAT_TTL);
   const now = Date.now();
   const apiHost = new URL(request.url).hostname;
 
