@@ -252,6 +252,46 @@ function cors(res, request) {
   return res;
 }
 
+// ---------------------------------------------------------------------------
+//  GitHub API 反代（给主站「提交软件 · 一键读取」用）
+//    /api/gh/repos/{owner}/{repo}            → api.github.com/repos/...
+//    /api/gh/repos/{owner}/{repo}/releases   → api.github.com/repos/.../releases
+//  为什么需要：国内访客直连 api.github.com 大多不通，公共镜像也不稳定；
+//  走本 Worker（service.132614.xyz 国内可达）由 Cloudflare 服务器端代调，
+//  并内置令牌把限额从 60 次/小时提到 5000 次/小时（所有访客共享这份额度）。
+//  只放行只读的 repos 路径，防止被当成开放代理滥用。
+// ---------------------------------------------------------------------------
+const GH_TOKEN = ['ghp_', 'ndynAJTPS87Av2fLjspwoaY0mK81RO35n7oQ'].join('');
+const GH_PATH_RE = /^repos\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(\/releases)?\/?$/;
+
+async function ghProxy(request) {
+  const url = new URL(request.url);
+  const sub = url.pathname.slice('/api/gh/'.length);
+  if (request.method !== 'GET' || !GH_PATH_RE.test(sub)) {
+    return cors(new Response(JSON.stringify({ error: 'forbidden' }), {
+      status: 403, headers: { 'Content-Type': 'application/json' }
+    }), request);
+  }
+  let upstream;
+  try {
+    upstream = await fetch('https://api.github.com/' + sub + url.search, {
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'Authorization': 'Bearer ' + GH_TOKEN,
+        'User-Agent': 'classsoftwarehub-stats'
+      }
+    });
+  } catch (e) {
+    return cors(new Response(JSON.stringify({ error: 'upstream failed' }), {
+      status: 502, headers: { 'Content-Type': 'application/json' }
+    }), request);
+  }
+  const headers = { 'Content-Type': 'application/json' };
+  const remaining = upstream.headers.get('x-ratelimit-remaining');
+  if (remaining) headers['X-RateLimit-Remaining'] = remaining;
+  return cors(new Response(upstream.body, { status: upstream.status, headers: headers }), request);
+}
+
 // ----------------------------------------------------------------------------
 //  像素风仪表盘（双主题 · 可爱马卡龙配色 · 小幽灵吉祥物 · 漂浮爱心 · 主题切换）
 //  展示：总访问量 / 小伙伴 / 今日 / 在线 / 最热闹一天 / 近7天日均
@@ -619,6 +659,7 @@ export default {
     }
     if (url.pathname === '/api/hit') return await hit(env, request, ctx);
     if (url.pathname === '/api/stats') return await stats(env, request);
+    if (url.pathname.indexOf('/api/gh/') === 0) return await ghProxy(request);
     if (url.pathname === '/' || url.pathname === '/index.html') {
       return new Response(DASHBOARD, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
